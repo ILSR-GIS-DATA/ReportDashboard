@@ -18,8 +18,6 @@ library(RPostgres) #enables R to access postgres database
 library(bslib)
 library(bsicons)
 library(googlesheets4) #enables R ro read/write to google sheets
-library(arcgisbinding)
-arc.check_product()
 library(janitor)
 library(tidycensus)
 library(leaflet.providers)
@@ -35,6 +33,7 @@ Sys.getenv("CENSUS_API_KEY")
 options(scipen = 999)
 #renv::init()
 #renv::snapshot()
+#rsconnect::writeManifest()
 ```
 
 ```{r theme, echo=FALSE}
