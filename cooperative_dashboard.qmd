@@ -34,6 +34,7 @@ readRenviron(".Renviron")
 Sys.getenv("CENSUS_API_KEY")
 options(scipen = 999)
 #renv::init()
+#renv::snapshot()
 ```
 
 ```{r theme, echo=FALSE}
