@@ -1,0 +1,825 @@
+---
+title: "Cooperative Fiber Networks"
+author: "Institute for Local Self-Reliance"
+format: 
+  dashboard: 
+      theme: flatly
+---
+
+```{r settings, include=FALSE}
+#| message: false
+library(tidyverse)
+library(httr2)
+library(sf)
+library(leaflet)
+library(gt)
+library(DBI)
+library(RPostgres) #enables R to access postgres database
+library(bslib)
+library(bsicons)
+library(googlesheets4) #enables R ro read/write to google sheets
+library(arcgisbinding)
+arc.check_product()
+library(janitor)
+library(tidycensus)
+library(leaflet.providers)
+library(tigris)
+library(leaflet.minicharts)
+library(htmltools)
+library(duckdb)
+library(ggplot2)
+library(ggwaffle)
+
+readRenviron(".Renviron")
+Sys.getenv("CENSUS_API_KEY")
+options(scipen = 999)
+#renv::init()
+```
+
+```{r theme, echo=FALSE}
+my_gt_theme <- function(gt_tbl) {
+  # Grab number of rows of data from gt object
+  n_rows <- nrow(gt_tbl$`_data`)
+  
+  gt_tbl %>%
+    tab_options(
+      data_row.padding = px(6),
+      heading.align = 'center',
+      column_labels.background.color = '#051C4A',
+      heading.title.font.size = px(26),
+      heading.subtitle.font.size = px(14),
+      table_body.hlines.width = px(0)
+    ) %>%
+    tab_style(
+      style = cell_text(
+        color = '#051C4A', 
+        weight = 'bold', 
+        font = google_font('Inter')
+      ),
+      locations = cells_title(groups = 'title')
+    ) 
+}
+```
+
+```{r load data, echo=FALSE, include=FALSE}
+
+ #drv <- RPostgres::dbDriver("PostgreSQL") 
+con <-  RPostgres::dbConnect(drv = Postgres(), user = "postgres", 
+                             password = Sys.getenv("db_password"), 
+                             dbname = Sys.getenv("dbname"), port = "5433") 
+
+
+##DuckDB details
+dbcon <- dbConnect(duckdb(), "E:/duckdb_cli-windows-amd64/duckdb_j25/bdc_j25.duckdb")
+
+#load in the most recent list of cooperatives we identified 
+coop <- dbGetQuery(con, "SELECT  provider_id, 
+                                 coop_type,
+                                 tech,
+                                 string_agg(DISTINCT brand_name, ', ' ORDER BY brand_name) AS brand_name
+                         FROM lookup.provider_version
+                         WHERE isp_type = 'Cooperative' AND 
+                         j25 = '1'::text
+                         GROUP BY provider_id, coop_type, tech;") 
+
+
+#dbDisconnect(con)
+#dbDisconnect(dbcon)
+
+
+
+e_footprint <- st_read(
+  con,
+  query = "SELECT provider_id, brand_name, 
+  ST_SimplifyPreserveTopology(shape, 0.001) AS shape  
+  FROM staging_bdc_avail.bdc_fiber_electric_dissolved;"
+)
+
+#class(e_fiber)
+
+t_footprint <- st_read(
+  con,
+  query = "SELECT provider_id, brand_name, 
+  ST_SimplifyPreserveTopology(shape, 0.001) AS shape 
+  FROM staging_bdc_avail.bdc_fiber_telephone_dissolved;"
+)
+
+te_footprint <- st_read(
+  con,
+  query = "SELECT provider_id, brand_name, 
+  ST_SimplifyPreserveTopology(shape, 0.001) AS shape 
+  FROM staging_bdc_avail.bdc_fiber_telelec_dissolved;"
+)
+
+f_footprint <- st_read(
+  con,
+  query = "SELECT provider_id, brand_name, 
+  ST_SimplifyPreserveTopology(shape, 0.001) AS shape 
+  FROM staging_bdc_avail.bdc_fiber_fiber_dissolved;"
+)
+
+st_boundaries <- states(refresh=TRUE)
+
+#load in ACS population data (calculated in Arc)
+us_pop <- get_estimates(geography = "us", product = "population") %>% 
+  subset(variable == "POPESTIMATE") %>% select(value)
+us_pop <- as.vector(us_pop$value)
+
+#basemaps <- get_providers(version_num = NULL)
+```
+
+```{r all cooperative widgets}
+#what is the total number of co-ops offering any kind of Internet service?
+coop_count <- coop %>% summarize(n = n_distinct(provider_id)) %>% pull(n)
+
+#what is the total number of Electric co-ops offering any Internet service?
+e_count <- coop %>%
+  filter(coop_type == "Electric" ) %>%
+  summarise(n = n_distinct(provider_id)) %>%
+  pull(n)
+
+#what is the total number of Telephone co-ops offering any Internet service?
+t_count <- coop %>%
+  filter(coop_type == "Telephone" ) %>%
+  summarise(n = n_distinct(provider_id)) %>%
+  pull(n)
+
+#what percent of hh's have access to fiber from any ISP?
+
+
+#what percent of those hh's have fiber access from a co-op?
+
+
+```
+
+```{r service across rural locations, echo=FALSE, warning=FALSE}
+
+rural_service <- dbGetQuery(dbcon, 
+              "SUMMARIZE (
+    SELECT distinct_fiber, coop_fiber, distinct_wireline
+    FROM wireline_comp
+    WHERE urbancoretype = 'Rural');") %>%
+  select(column_name, min, max, avg, std) %>%
+  mutate(across(c(min:std), ~round(as.numeric(.), 2))) %>%
+  rename("service" = "column_name") %>%
+  as_tibble()
+
+rural_locs_served <- dbGetQuery(dbcon, "
+  SELECT
+    COUNT(DISTINCT location_id)                                   AS locs_total,
+    COUNT(DISTINCT location_id) FILTER (WHERE distinct_fiber > 0)    AS distinct_fiber,
+    COUNT(DISTINCT location_id) FILTER (WHERE coop_fiber > 0)        AS coop_fiber,
+    COUNT(DISTINCT location_id) FILTER (WHERE distinct_wireline > 0) AS distinct_wireline
+  FROM wireline_comp
+  WHERE urbancoretype = 'Rural';") %>%
+  tidyr::pivot_longer(-locs_total, names_to = "service", values_to = "locs_served")
+
+rural_service2 <- rural_service %>%
+  left_join(rural_locs_served, by = "service") %>%
+  mutate(pct_served = round(100 * locs_served / locs_total, 1)) %>%
+  select(service, locs_total, locs_served, pct_served, min, max, avg, std) %>%
+  mutate(service = recode(service,
+                          distinct_wireline = "Any Wireline",
+                          distinct_fiber    = "Any Fiber",
+                          coop_fiber        = "Cooperative Fiber" ))
+
+  
+#create a table of service types summaries
+# rural_service2 %>% arrange(desc(avg)) %>%
+#   select(service, pct_served) %>% filter(service != "Any Wireline") %>%
+#   gt() %>%
+#   tab_header(
+#     title = "Summary of Wireline Internet Competition in Rural Areas",
+#     subtitle = "Percent served indicates the percent of locations with at least one wired option that have the service type."
+#   ) %>%
+#   cols_label(
+#     service = "Service Type",
+#     pct_served = "Percent Served"
+#   ) %>%
+#   fmt_number(decimals = 1) %>%
+#   cols_align(align = "left", columns = service) %>%
+#   cols_align(align = "center", columns = c(pct_served)) %>%
+#   my_gt_theme()
+
+#what percent of rural areas can receive cooperative fiber service?
+rural_coop_fiber <- rural_service2 %>% filter(service == "Cooperative Fiber") %>% select(pct_served)
+```
+
+```{r percent of rural pop without high-speed wireline, echo=FALSE}
+
+#calculate the total rural pop without wireline options 
+rpop <- dbGetQuery(dbcon, "
+WITH rural AS (
+SELECT        
+  DISTINCT (block_id),
+  urbancoretype
+  FROM wireline_comp
+  WHERE urbancoretype ='Rural')
+SELECT SUM(b.pop2023) AS pop
+FROM staff_block_est b
+INNER JOIN rural a ON a.block_id = b.block_id
+  ;")
+#convert that value to a vector
+rpop_v <- as_vector(rpop$pop)
+
+#calculate the total rural population with => 2 distinct wireline options 
+rpop_no <- dbGetQuery(dbcon, "
+WITH rural AS (
+SELECT        
+  DISTINCT (block_id),
+  urbancoretype
+  FROM wireline_comp
+  WHERE urbancoretype = 'Rural' AND
+  distinct_wireline =0)
+SELECT SUM(b.pop2023) AS pop
+FROM staff_block_est b
+INNER JOIN rural a ON a.block_id = b.block_id
+  ;")
+
+#convert that value to a vector
+rpopno_v <- as_vector(rpop_no$pop)
+
+#calculate the percentage
+rpopno_pct <- (rpopno_v/rpop_v)*100
+```
+
+```{r waffle plot fiber comp rurality, echo=FALSE}
+
+#create a summary of the co-op fiber competition across population density
+coop_fiber_comp <- dbGetQuery(dbcon, "SELECT urbancoretype, coop_fiber FROM wireline_comp WHERE urbancoretype IS NOT NULL AND urbancoretype != 'Water';") %>% 
+  count(coop_fiber, urbancoretype) %>%
+  pivot_wider(
+    names_from = urbancoretype,
+    values_from = n,
+    values_fill = 0
+  ) %>% 
+  rename("Metro" = `Metro core`, "Micro" = `Micro core`, "Small-town" = `Small town core`, "Providers" = coop_fiber) %>%
+  select(Providers, Metro, Micro, `Small-town`, Rural)
+
+
+rurality_levels <- c("Metro", "Micro", "`Small-town`", "Rural")
+
+#create a summary of the wired competition across population density
+wired_comp <- dbGetQuery(dbcon, "SELECT urbancoretype, distinct_wireline FROM wireline_comp WHERE urbancoretype IS NOT NULL AND urbancoretype != 'Water';") %>% 
+  count(distinct_wireline, urbancoretype) %>%
+  pivot_wider(
+    names_from = urbancoretype,
+    values_from = n,
+    values_fill = 0
+  ) %>% 
+  rename("Metro" = `Metro core`, "Micro" = `Micro core`, "Small-town" = `Small town core`, "Providers" = distinct_wireline) %>%
+  select(Providers, Metro, Micro, `Small-town`, Rural)
+
+co_op_total_comp <- wired_comp %>%
+  left_join(coop_fiber_comp, by = "Providers", suffix = c("", "_coop"))  %>%
+  mutate(across(where(is.numeric), ~ replace_na(.x, 0)))
+
+areas <- c("Metro", "Micro", "Small-town", "Rural")
+
+waffle_summary <- lapply(areas, function(a) {
+  coop_col   <- paste0(a, "_coop")
+  total      <- sum(co_op_total_comp[[coop_col]])
+  zero_coop  <- co_op_total_comp[[coop_col]][co_op_total_comp$Providers == 0]
+  pct_filled <- round((total - zero_coop) / total * 100)
+
+  dplyr::tibble(
+    area   = a,
+    status = c("Co-op present", "No co-op"),
+    pct    = c(pct_filled, 100 - pct_filled)
+  )
+}) %>% dplyr::bind_rows()
+
+# Expand to one row per square (100 per area), then run through waffle_iron per area
+waffle_data <- waffle_summary %>%
+  uncount(pct) %>%
+  group_by(area) %>%
+  group_modify(~ waffle_iron(.x, aes_d(group = status), rows = 10)) %>%
+  ungroup() %>% 
+  mutate(area = factor(area,
+                          levels = c("Metro", "Micro", "Small-town", "Rural"))) %>%
+  arrange(area)
+
+p <- ggplot(waffle_data, aes(x = x, y = y, fill = group)) +
+  geom_tile(color = "white", linewidth = 0.5) +
+  facet_wrap(~area, nrow = 1, strip.position = "bottom") +
+  coord_equal() +
+  MetBrewer::scale_fill_met_d("Hiroshige", direction = 1) +
+  labs(title = "Co-op Presence Across Population Density",
+       subtitle = "Share of locations where at least one cooperative provider offers fiber Internet access",
+       fill = NULL) +
+  theme_minimal() +
+  theme(
+    axis.title = element_blank(),
+    axis.text = element_blank(),
+    axis.ticks = element_blank(),
+    panel.grid = element_blank(),
+    legend.position = "top",
+    legend.title = element_blank(),
+    strip.text = element_text(size = 12)
+  )
+
+```
+
+
+```{r co-op fed funding summary}
+
+progs <- dbGetQuery(con,"SELECT * FROM raw_fcc.bfm_program_data;")
+
+
+electric_fund <- dbGetQuery(con, "
+  SELECT program_id, provider_id,
+         string_agg(DISTINCT brand_name, ', ' ORDER BY brand_name) AS brand_name,
+         project_id,
+         SUM(locs_planned) AS locs_planned
+  FROM (
+    SELECT program_id,
+           providerid AS provider_id,
+           COALESCE(NULLIF(TRIM(brandname), ''), project) AS brand_name,
+           project_id,
+           loc_plan AS locs_planned
+    FROM staging_bfm.bfm_fiber_electric
+
+    UNION ALL
+
+    SELECT program_id,
+           provider_id,
+           brand_name,
+           project_id,
+           planned AS locs_planned
+    FROM staging_bfm.bfmbl_fiber_electric
+  ) AS combined
+  GROUP BY program_id, provider_id, project_id
+  ORDER BY program_id, provider_id, project_id;") %>%
+  as_tibble() %>%
+  left_join(y = progs %>% select(program_id, program_name, program_acronym), by = "program_id") %>%
+  mutate(coop_type = 'Electric')
+
+
+telephone_fund <- dbGetQuery(con, "
+  SELECT program_id, provider_id,
+         string_agg(DISTINCT brand_name, ', ' ORDER BY brand_name) AS brand_name,
+         project_id,
+         SUM(locs_planned) AS locs_planned
+
+  FROM (
+    SELECT 
+      program_id, 
+      providerid AS provider_id, 
+      COALESCE(NULLIF(TRIM(brandname), ''), project) AS brand_name, 
+      project_id,
+      loc_plan AS locs_planned
+      FROM staging_bfm.bfm_fiber_telephone
+    UNION ALL
+    SELECT program_id, provider_id, brand_name, project_id, planned AS locs_planned FROM staging_bfm.bfmbl_fiber_telephone
+  )
+  GROUP BY program_id, provider_id, project_id
+  ORDER BY program_id, provider_id, project_id;") %>%
+  as_tibble() %>% left_join(y = progs %>% select(program_id, program_name, program_acronym), by = "program_id") %>%
+  mutate(coop_type = 'Telephone')
+
+other_fund <- dbGetQuery(con, "
+  SELECT
+      program_id, 
+      providerid AS provider_id, 
+      COALESCE(NULLIF(TRIM(brandname), ''), project) AS brand_name, 
+      project_id,
+      loc_plan AS locs_planned
+      FROM staging_bfm.bfm_fiber_othercoop
+  GROUP BY program_id, providerid, project_id, brand_name, loc_plan
+  ORDER BY program_id, providerid, project_id, brand_name, loc_plan;") %>%
+  as_tibble() %>% left_join(y = progs %>% select(program_id, program_name, program_acronym), by = "program_id") %>%
+  mutate(coop_type = 'Tel-Elec')
+
+
+
+
+#How many providers/projects/locations have been funded?
+funds_by_coop_type <- bind_rows(electric_fund, telephone_fund, other_fund) %>% 
+  summarise(provider_count = n_distinct(provider_id), project_count = n_distinct(project_id), locs_planned = sum(locs_planned), .by = c(coop_type, program_id, program_name, program_acronym)) %>%
+  arrange(program_id, coop_type)
+
+#check that project_id count is correct
+#electric_fund %>% subset(program_id == "10") %>% select(project_id) %>% n_distinct()
+
+#how many federal programs have cooperatives received funding to build fiber?
+total_programs <- n_distinct(funds_by_coop_type$program_id)
+
+#how many providers overall, by type, have been funded?
+provider_fund_by_type <- bind_rows(electric_fund, telephone_fund, other_fund) %>% 
+  summarise(provider_count = n_distinct(provider_id), .by = "coop_type")
+
+#how many providers total have received funding to build fiber?
+providers_funded <- bind_rows(electric_fund, telephone_fund, other_fund) %>%
+  summarise(provider_count = n_distinct(provider_id)) %>% pull(provider_count)
+```
+
+
+```{r fiber cooperative widgets}
+#what is the total number of co-ops offering fiber service?
+coop_fiber <- coop %>% subset(tech == 50) %>% summarize(n = n_distinct(provider_id)) %>% pull(n)
+
+#what is the total number of Electric co-ops offering fiber service?
+e_fiber <- coop %>%
+  filter(coop_type == "Electric" & tech == 50) %>%
+  summarise(n = n_distinct(provider_id)) %>%
+  pull(n)
+
+#what is the total number of Telephone co-ops offering fiber service?
+t_fiber <- coop %>%
+  filter(coop_type == "Telephone" & tech == 50) %>%
+  summarise(n = n_distinct(provider_id)) %>%
+  pull(n)
+
+
+```
+
+```{r  map prep}
+#create pop-ups
+e_footprint <- e_footprint %>% 
+   mutate(popup_html = paste0( 
+     "<strong>", brand_name,"</strong><br>"),
+     #"Service type: ", service_type, 
+     #"<br>", "Max speed: ", max_speed_mbps, " Mbps<br>",   
+     #"Members served: ", format(members_served, big.mark = ","), 
+     #"<br>", "Contact: <a href='mailto:", contact, "'>", contact, "</a>" ),
+     label_html = paste0(brand_name))
+ 
+ t_footprint <- t_footprint %>% 
+   mutate(popup_html = paste0( 
+     "<strong>", brand_name,"</strong><br>"),
+     #"Service type: ", service_type, 
+     #"<br>", "Max speed: ", max_speed_mbps, " Mbps<br>",   
+     #"Members served: ", format(members_served, big.mark = ","), 
+     #"<br>", "Contact: <a href='mailto:", contact, "'>", contact, "</a>" ),
+     label_html = paste0(brand_name))
+ 
+ te_footprint <- te_footprint %>% 
+   mutate(popup_html = paste0( 
+     "<strong>", brand_name,"</strong><br>"),
+     #"Service type: ", service_type, 
+     #"<br>", "Max speed: ", max_speed_mbps, " Mbps<br>",   
+     #"Members served: ", format(members_served, big.mark = ","), 
+     #"<br>", "Contact: <a href='mailto:", contact, "'>", contact, "</a>" ),
+     label_html = paste0(brand_name))
+
+ f_footprint <- f_footprint %>% 
+   mutate(popup_html = paste0( 
+     "<strong>", brand_name,"</strong><br>"),
+     #"Service type: ", service_type, 
+     #"<br>", "Max speed: ", max_speed_mbps, " Mbps<br>",   
+     #"Members served: ", format(members_served, big.mark = ","), 
+     #"<br>", "Contact: <a href='mailto:", contact, "'>", contact, "</a>" ),
+     label_html = paste0(brand_name))
+ 
+ # Boundaries
+# Generalized (cb = TRUE) boundaries load fast and look clean at this zoom
+states_sf <- tigris::states(cb = TRUE, resolution = "20m") %>%
+  sf::st_transform(4326)
+
+# Optional: drop territories if you only want the 50 states + DC
+states_sf <- states_sf[!states_sf$STUSPS %in% c("PR", "VI", "GU", "MP", "AS"), ]
+
+#set crs 
+e_footprint <- st_transform(e_footprint, crs = 4326)
+t_footprint <- st_transform(t_footprint, crs = 4326)
+te_footprint <- st_transform(te_footprint, crs = 4326)
+f_footprint <- st_transform(f_footprint, crs = 4326)
+
+
+```
+
+# View Cooperative Fiber 
+
+
+## Column {width=25%}
+
+
+```{r}
+#| content: valuebox
+#| title: "Number of Cooperatives Offering Fiber Internet"
+
+list(
+  icon = "router",
+  value = coop_fiber
+)
+```
+
+
+```{r}
+#| content: valuebox
+#| title: "Number of Electric Cooperatives Offering Fiber Internet"
+
+list(
+  icon = "lightning-charge",
+  value = e_fiber
+)
+```
+
+```{r}
+#| content: valuebox
+#| title: "Number of Telephone Cooperatives Offering Fiber Internet"
+
+list(
+  icon = "telephone",
+  value = t_fiber
+)
+```
+
+## Column {width=75%}
+
+```{r no legend, echo=FALSE}
+
+# #print("interactive map: all cooperatives offering fiber")
+# leaflet() %>%
+#  addTiles(
+#   urlTemplate = "https://basemaps.cartocdn.com/rastertiles/light_all/{z}/{x}/{y}.png?key=cb1_2h1o_1_ac4f6a1f67f7a54987f0abee",
+#   attribution = 'Map tiles by <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>, <a href="https://carto.com/attributions">CARTO</a>')  %>%
+#   setView(lng = -97.8, lat = 41.1, zoom = 4) %>%
+#   addPolygons(
+#     data = e_footprint,
+#     fillColor   = "#051C4A",
+#     color       = "#051C4A",
+#     weight      = 1,
+#     fillOpacity = 0.5,
+#     label       = ~lapply(label_html, htmltools::HTML),
+#     popup       = ~popup_html,
+#     group = "Electric Cooperatives") %>%
+#   addPolygons(
+#     data = t_footprint,
+#     fillColor   = "#F48156",
+#     color       = "#F48156",
+#     weight      = 1,
+#     fillOpacity = 0.5,
+#     label       = ~lapply(label_html, htmltools::HTML),
+#     popup       = ~popup_html,
+#     group = "Telephone Cooperatives") %>%
+#   addPolygons(
+#     data = te_footprint,
+#     fillColor   = "#53CCDD",
+#     color       = "#53CCDD",
+#     weight      = 1,
+#     fillOpacity = 0.5,
+#     label       = ~lapply(label_html, htmltools::HTML),
+#     popup       = ~popup_html,
+#     group = "Telephone-Electric Cooperatives")  %>% 
+#   addLayersControl( overlayGroups = c("Electric Cooperatives", "Telephone Cooperatives","Telephone-Electric Cooperatives" ), 
+#                     options = layersControlOptions(collapsed = FALSE)) %>%  
+#   addScaleBar(position = "bottomleft") %>%
+#   addLegend(position = "topright")
+```
+
+```{r legend}
+# Helper: colored swatch + label
+swatch <- function(color, label) {
+  paste0(
+    "<span style='display:inline-block;width:14px;height:14px;",
+    "background:", color, ";opacity:0.7;border:1px solid ", color, ";",
+    "margin-right:6px;vertical-align:middle;'></span>", label
+  )
+}
+
+grp_e  <- swatch("#051C4A", "Electric Cooperatives")
+grp_t  <- swatch("#F48156", "Telephone Cooperatives")
+grp_te <- swatch("#53CCDD", "Telephone-Electric Cooperatives")
+grp_f <- swatch("#545454", "Fiber Cooperatives")
+
+leaflet() %>%
+  addTiles(
+    urlTemplate = "https://basemaps.cartocdn.com/rastertiles/light_all/{z}/{x}/{y}.png?key=cb1_2h1o_1_ac4f6a1f67f7a54987f0abee",
+    attribution = 'Map tiles by <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>, <a href="https://carto.com/attributions">CARTO</a>') %>%
+  setView(lng = -97.8, lat = 41.1, zoom = 4) %>%
+  addPolygons(
+    data = e_footprint,
+    fillColor = "#051C4A", color = "#051C4A", weight = 1, fillOpacity = 0.5,
+    label = ~lapply(label_html, htmltools::HTML),
+    popup = ~popup_html,
+    group = grp_e) %>%
+  addPolygons(
+    data = t_footprint,
+    fillColor = "#F48156", color = "#F48156", weight = 1, fillOpacity = 0.5,
+    label = ~lapply(label_html, htmltools::HTML),
+    popup = ~popup_html,
+    group = grp_t) %>%
+  addPolygons(
+    data = te_footprint,
+    fillColor = "#53CCDD", color = "#53CCDD", weight = 1, fillOpacity = 0.5,
+    label = ~lapply(label_html, htmltools::HTML),
+    popup = ~popup_html,
+    group = grp_te) %>%
+   addPolygons(
+    data = f_footprint,
+    fillColor = "#545454", color = "#545454", weight = 1, fillOpacity = 0.5,
+    label = ~lapply(label_html, htmltools::HTML),
+    popup = ~popup_html,
+    group = grp_f) %>%
+   # State boundaries: added last so they sit on top
+  addPolylines(
+    data = states_sf,
+    color = "#333333", weight = .5, opacity = 0.8,
+    options = pathOptions(interactive = FALSE),  # lets clicks/hovers pass through to the co-op polygons
+    group = "State boundaries") %>%
+  addLayersControl(
+    overlayGroups = c(grp_e, grp_t, grp_te, grp_f),
+    options = layersControlOptions(collapsed = FALSE)) %>%
+  addScaleBar(position = "bottomleft")
+ 
+
+```
+
+# View Cooperative Technologies
+
+## Row 1
+
+```{r}
+
+#get tech x state cooperative stats
+coop_tech_state <- dbGetQuery(con, "SELECT * FROM analysis_summary.coop_techstate_summary;") %>% rename("NAME" = "state_name") %>% mutate(locs_claimed = as.numeric(locs_claimed)) %>%
+select(NAME, tech_name, pop_claimed) %>%
+pivot_wider(names_from = "tech_name", values_from = pop_claimed)  %>%
+right_join(st_boundaries, by = "NAME") %>%
+select(NAME:`Licensed-by-Rule Terrestrial Fixed Wireless`, INTPTLAT, INTPTLON) %>%
+ mutate(
+    lon = as.double(INTPTLON),
+    lat = as.double(INTPTLAT)) %>%
+ st_as_sf(coords = c("lon", "lat"),crs = 4326) %>%
+  rename("Copper" = "Copper Wire",
+         "Fiber" = "Optical Carrier; Fiber to the Premises",
+         "Cable" = "Coaxial Cable; HFC",
+         "LFW" = "Licensed Terrestrial Fixed Wireless",
+         "UFW" = "Unlicensed Terrestrial Fixed Wireless",
+         "LBRFW" = "Licensed-by-Rule Terrestrial Fixed Wireless")
+
+coords <- st_coordinates(coop_tech_state)
+
+chartdata <- coop_tech_state %>%
+  st_drop_geometry() %>%
+  select(
+    Cable,
+    Copper,
+    Fiber,
+    LFW,
+    LBRFW,
+    UFW
+  ) %>%
+  mutate(across(everything(), ~replace(., is.na(.), 0))) %>%
+  as.matrix() 
+
+# colors1 <- c("#1f8290", "#fbcc76", "#f48156", "#5b73ae", "#cdf266", "#53ccdd")
+# colors2 <- c("#051c4a", "#33054a", "#4a051c", "#4a3305", "#1c4a05", "#054a33")
+# colors3 <- c("#1f8290", "#2d1f90", "#902d1f","#82901f","#901f82", "#1f902d")
+# colors4 <- c("#f7a57e", "#d0f77e", "#7ef7a5", "#7ed0f7","#a57ef7", "#f77ed0"  )
+# colors <- c("#1f8290", "#2d1f90", "#902d1f","#82901f" )
+
+colors <- c(
+  Cable  = "#f48156",
+  Copper = "#1f8290",
+  Fiber  = "#fbcc76",
+  LFW    = "#5b73ae",
+  LBRFW  = "#53ccdd",
+  UFW    = "#cdf266"
+)
+
+#Set up the pop-up formatting
+popup_html <- apply(chartdata, 1, function(row) {
+  paste0(
+    "<b>", names(row), ":</b> ",
+    format(row, big.mark = ",", scientific = FALSE, trim = TRUE),
+    collapse = "<br>"
+  )
+})
+
+# prepend the state name as a title, since html popups replace the whole popup
+popup_html <- paste0(
+  "<div style='font-size:16px; font-weight:bold; margin-bottom:4px;'>",
+  coop_tech_state$NAME,
+  "</div>",
+  popup_html
+)
+
+#create the map
+leaflet() %>%
+  addTiles(
+    urlTemplate = "https://basemaps.cartocdn.com/rastertiles/light_all/{z}/{x}/{y}.png?key=cb1_2h1o_1_ac4f6a1f67f7a54987f0abee",
+    attribution = 'Map tiles by <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>, <a href="https://carto.com/attributions">CARTO</a>'
+  ) %>%
+  setView(lng = -97.8, lat = 41.1, zoom = 4) %>%
+  addMinicharts(
+    lng = coords[, "X"],
+    lat = coords[, "Y"],
+    type = "pie",
+    chartdata = chartdata,
+    colorPalette = unname(colors),
+    width = 20,
+    legend = TRUE,
+    legendPosition = "topleft",
+    popup = popupArgs(html = popup_html)
+  )%>%
+   # State boundaries: added last so they sit on top
+  addPolylines(
+    data = states_sf,
+    color = "#333333", weight = .5, opacity = 0.8,
+    options = pathOptions(interactive = FALSE),  # lets clicks/hovers pass through to the co-op polygons
+    group = "State boundaries")
+
+
+
+
+```
+
+# Rural Connectivity {orientation="columns"}
+
+## Column 1 {width=25%}
+
+```{r any coop internet}
+#| content: valuebox
+#| title: "Population without a High-Speed Wireline Option"
+
+list(
+  icon = "ban",
+  value = paste0(round(rpopno_pct, 0), "%")
+)
+```
+
+```{r rural fiber service}
+#| content: valuebox
+#| title: "Rural Locations with Access to Cooperative Fiber Service"
+
+list(
+  icon = "houses",
+  value = paste0(round(rural_coop_fiber$pct_served, 0), "%")
+)
+```
+
+
+## Column 2 {width=75%}
+
+```{r waffle plot}
+p
+```
+
+# Funding {orientation="columns"}
+
+## Column 1 {width=25%}
+
+```{r coop funding number}
+#| content: valuebox
+#| title: "Cooperatives Awarded Federal Funds to Build Fiber"
+
+list(
+  value = providers_funded
+)
+```
+
+```{r program funding number}
+#| content: valuebox
+#| title: "Federal Programs Funding Cooperative Fiber"
+
+list(
+  value = total_programs
+)
+```
+
+
+## Column 2 {width=75%}
+
+```{r funding table}
+#| title: "Federal Funding for Fiber"
+
+funds_by_coop_type %>%
+  arrange(program_acronym) %>%
+  select(coop_type, program_acronym, provider_count:locs_planned) %>%
+  gt(rowname_col = "program_acronym") %>%
+  tab_row_group(
+    label = md("**Electric Cooperatives**"),
+    rows = coop_type == "Electric",
+    id = "electric"
+  ) %>%
+  tab_row_group(
+    label = md("**Telephone Cooperatives**"),
+    rows = coop_type == "Telephone",
+    id = "telephone"
+  ) %>%
+  tab_row_group(
+    label = md("**Other Cooperatives**"),
+    rows = coop_type == "Tel-Elec",
+    id = "tel-elec"
+  ) %>%
+  fmt_integer(columns = provider_count:locs_planned) %>%
+  cols_align(align = "left", columns = program_acronym) %>%
+  cols_align(align = "center", columns = provider_count:locs_planned) %>%
+  row_group_order(groups = c("electric", "telephone", "tel-elec" )) %>%
+  cols_hide(columns = coop_type) %>%
+   cols_label(
+    provider_count = "Providers",
+    project_count = "Projects",
+    locs_planned = "Locations"
+  ) %>%
+  # grand_summary_rows(
+  #   columns = count,
+  #   fns = list(Total = ~sum(.)),
+  #   fmt = ~fmt_integer(.)
+  # ) %>%
+  #opt_row_striping() %>%
+  my_gt_theme()
+
+```
